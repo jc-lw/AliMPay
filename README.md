@@ -30,6 +30,67 @@ composer install
 # 复制配置文件
 cp config/alipay.example.php config/alipay.php
 ```
+# CodePay 支付宝免签支付系统宝塔面板部署手册
+
+**适用环境**：Linux (CentOS/Ubuntu/Debian) + 宝塔面板 (aaPanel/BT Panel)
+**核心架构**：Nginx + PHP 8.1 + SQLite (无MySQL)
+
+---
+
+## 一、 环境准备 (Prerequisites)
+
+在宝塔面板 (App Store) 中安装以下软件：
+
+1.  **Nginx**: 1.22 或更高版本
+2.  **PHP**: **8.1** (推荐) 或 7.4
+
+### 1.1 配置 PHP 扩展
+进入 **App Store -> PHP 8.1 -> Extensions**，安装以下必须扩展：
+* `sqlite3` & `pdo_sqlite` (数据库核心)
+* `bcmath` (金额高精度计算)
+* `gd` (生成二维码)
+* `fileinfo` (文件处理)
+* `curl` (网络请求)
+
+### 1.2 解除禁用函数 (关键)
+为了让系统能在后台自动监控订单，必须允许 PHP 执行系统命令。
+进入 **App Store -> PHP 8.1 -> Disabled functions**，**删除**以下函数：
+* `exec`
+* `shell_exec`
+* `proc_open`
+* `pcntl_exec`
+* `pcntl_signal`
+* `pcntl_alarm`
+
+> **操作后请务必重启 PHP 服务！** (Service -> Restart)
+
+---
+
+## 二、 网站搭建与代码上传
+
+1.  **创建网站**：
+    * 在 **Website** 菜单添加新站点。
+    * **Domain**: 填写你的域名（例如 `pay.example.com`）。
+    * **Database**: 选择 `No Database` (本项目使用 SQLite 文件数据库)。
+    * **PHP Version**: 选择 `PHP-81`。
+
+2.  **上传代码**：
+    * 进入网站根目录 `/www/wwwroot/你的域名/`。
+    * 删除默认的 `index.html` / `404.html`。
+    * 上传所有项目文件。确保 `src/`, `config/`, `api.php` 等都在根目录下。
+
+---
+
+## 三、 安装依赖与权限设置
+
+### 3.1 安装 Composer 依赖
+点击网站根目录的 **Terminal** 按钮，或者通过 SSH 进入目录执行：
+
+```bash
+cd /www/wwwroot/你的域名/
+# 安装生产环境依赖
+composer install --no-dev --optimize-autoloader
+
 
 ### 3. 支付宝配置
 
@@ -240,3 +301,4 @@ MIT License
 ## 免责声明
 
 本项目仅供学习交流使用，使用者需确保遵守相关法律法规和支付宝服务协议。 
+
