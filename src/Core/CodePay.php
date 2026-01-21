@@ -94,15 +94,20 @@ class CodePay
 
     private function initializeDatabase()
     {
-        $databaseFile = __DIR__ . '/../../data/codepay.db';
+        // 1. 计算绝对路径
+        $databaseFile = dirname(dirname(dirname(__FILE__))) . '/data/codepay.db';
+        
+        // 2. 初始化数据库配置
         $this->db = new \Medoo\Medoo([
             'database_type' => 'sqlite',
-            'database_file' => $databaseFile,
-            'database_name' => 'codepay'
+            'database_file' => $databaseFile, // 这里指定绝对路径
+            'database_name' => 'codepay'      // [必须加回这一行] 虽然SQLite不靠这个定位文件，但Medoo库检查它是否存在，不加会报错
         ]);
-        $this->logger->info('Database initialized.', ['file' => $databaseFile]);
+        
+        // 3. 记录日志 (保持你原来的代码)
+        // $this->logger->info('Database initialized.', ['file' => $databaseFile]);
 
-        // Create tables if they don't exist
+        // 4. 建表代码 (保持不变)
         $this->db->exec("
             CREATE TABLE IF NOT EXISTS codepay_orders (
                 id VARCHAR(32) PRIMARY KEY,
@@ -121,7 +126,7 @@ class CodePay
             );
         ");
         
-        // 检查表结构，确保payment_amount字段存在
+        // 5. 检查并修复字段 (保持不变)
         $columns = $this->db->query("PRAGMA table_info(codepay_orders);")->fetchAll();
         $hasPaymentAmount = false;
         foreach ($columns as $column) {
@@ -133,10 +138,7 @@ class CodePay
         
         if (!$hasPaymentAmount) {
             $this->db->exec("ALTER TABLE codepay_orders ADD COLUMN payment_amount DECIMAL(10, 2) DEFAULT 0");
-            $this->logger->info('Added payment_amount column to existing table.');
         }
-        
-        $this->logger->info('Database table codepay_orders initialized.', ['has_payment_amount' => $hasPaymentAmount]);
     }
     
     /**
@@ -241,9 +243,9 @@ class CodePay
         }
     }
 
-    /**
+/**
      * Create payment request according to CodePay protocol
-     * 按照码支付协议创建支付请求
+     * 按照码支付协议创建支付请求 (增加了幂等性检查，防止刷新变金额)
      */
     public function createPayment(array $params): array
     {
@@ -252,104 +254,145 @@ class CodePay
             // Validate required parameters
             $this->validatePaymentParams($params);
             
-            // Generate internal trade number
-            $tradeNo = $this->generateTradeNo();
-            
-            // 检查是否启用经营码收款模式
-            $businessQrMode = $this->config['payment']['business_qr_mode']['enabled'] ?? false;
-            $originalAmount = (float)$params['money'];
-            $paymentAmount = $originalAmount;
-            
-            $this->logger->info('Payment mode check.', [
-                'business_qr_mode' => $businessQrMode,
-                'original_amount' => $originalAmount,
-                'out_trade_no' => $params['out_trade_no']
+            // 【核心修改】步骤1：先检查是否已存在相同的待支付订单
+            // 防止用户刷新页面导致金额递增和生成重复订单
+            $existingOrder = $this->db->get('codepay_orders', '*', [
+                'out_trade_no' => $params['out_trade_no'],
+                'pid' => $this->merchantId,
+                'status' => 0 // 只查找未支付的
             ]);
+
+            $businessQrMode = $this->config['payment']['business_qr_mode']['enabled'] ?? false;
             
-            if ($businessQrMode) {
-                // 使用原子操作来分配唯一的支付金额
-                $offset = $this->config['payment']['business_qr_mode']['amount_offset'] ?? 0.01;
-                $paymentAmount = $this->allocateUniqueAmount($originalAmount, $offset);
+            if ($existingOrder) {
+                // 【核心修改】步骤2：如果存在，直接复用旧订单数据
+                $this->logger->info('Found existing pending order, reusing it.', [
+                    'out_trade_no' => $params['out_trade_no'],
+                    'existing_trade_no' => $existingOrder['id'],
+                    'locked_amount' => $existingOrder['payment_amount']
+                ]);
+
+                $tradeNo = $existingOrder['id'];
+                $paymentAmount = (float)$existingOrder['payment_amount'];
+                $originalAmount = (float)$existingOrder['price'];
                 
-                if ($paymentAmount != $originalAmount) {
-                    $this->logger->info('Amount adjusted to avoid conflicts.', [
-                        'original_amount' => $originalAmount,
-                        'adjusted_amount' => $paymentAmount,
-                        'offset' => $offset,
-                        'out_trade_no' => $params['out_trade_no']
+                // 重新生成/获取支付链接或二维码逻辑 (与下面保持一致)
+                if ($businessQrMode) {
+                    $qrCodePath = $this->config['payment']['business_qr_mode']['qr_code_path'];
+                    $token = md5('qrcode_access_' . date('Y-m-d'));
+                    $baseUrl = $this->getBaseUrl();
+                    $qrCodeUrl = $baseUrl . '/qrcode.php?type=business&token=' . $token;
+                    $paymentUrl = '经营码收款模式';
+                    $qrCodeBase64 = null;
+                } else {
+                    $alipayTransfer = new AlipayTransfer($this->config);
+                    $paymentUrl = $alipayTransfer->createOrder(
+                        $params['out_trade_no'],
+                        $paymentAmount,
+                        $params['name']
+                    );
+                    $qrCodeGenerator = new QRCodeGenerator();
+                    $qrCodeBase64 = $qrCodeGenerator->generate($paymentUrl);
+                    $qrCodeUrl = null;
+                }
+
+            } else {
+                // 【核心修改】步骤3：如果不存在，才执行原来的“创建新订单”逻辑
+                
+                // Generate internal trade number
+                $tradeNo = $this->generateTradeNo();
+                
+                $originalAmount = (float)$params['money'];
+                $paymentAmount = $originalAmount;
+                
+                $this->logger->info('Payment mode check.', [
+                    'business_qr_mode' => $businessQrMode,
+                    'original_amount' => $originalAmount,
+                    'out_trade_no' => $params['out_trade_no']
+                ]);
+                
+                if ($businessQrMode) {
+                    // 使用原子操作来分配唯一的支付金额
+                    $offset = $this->config['payment']['business_qr_mode']['amount_offset'] ?? 0.01;
+                    $paymentAmount = $this->allocateUniqueAmount($originalAmount, $offset);
+                    
+                    if ($paymentAmount != $originalAmount) {
+                        $this->logger->info('Amount adjusted to avoid conflicts.', [
+                            'original_amount' => $originalAmount,
+                            'adjusted_amount' => $paymentAmount,
+                            'offset' => $offset,
+                            'out_trade_no' => $params['out_trade_no']
+                        ]);
+                    }
+                }
+                
+                // Create order record in the database
+                $this->db->insert('codepay_orders', [
+                    'id' => $tradeNo,
+                    'out_trade_no' => $params['out_trade_no'],
+                    'type' => $params['type'],
+                    'pid' => $params['pid'],
+                    'name' => $params['name'],
+                    'price' => $originalAmount,  // 存储原始金额
+                    'payment_amount' => $paymentAmount,  // 存储实际支付金额
+                    'status' => 0,
+                    'add_time' => date('Y-m-d H:i:s'),
+                    'notify_url' => $params['notify_url'],
+                    'return_url' => $params['return_url'],
+                    'sitename' => $params['sitename'] ?? ''
+                ]);
+                
+                $this->logger->info('Order record created in database.', [
+                    'trade_no' => $tradeNo,
+                    'original_amount' => $originalAmount,
+                    'payment_amount' => $paymentAmount
+                ]);
+
+                // 根据收款模式生成不同的支付二维码
+                if ($businessQrMode) {
+                    $qrCodePath = $this->config['payment']['business_qr_mode']['qr_code_path'];
+                    
+                    if (!file_exists($qrCodePath)) {
+                        throw new \Exception('经营码二维码文件不存在，请先上传经营码到: ' . $qrCodePath);
+                    }
+                    
+                    $token = md5('qrcode_access_' . date('Y-m-d'));
+                    $baseUrl = $this->getBaseUrl();
+                    $qrCodeUrl = $baseUrl . '/qrcode.php?type=business&token=' . $token;
+                    
+                    $paymentUrl = '经营码收款模式'; 
+                    $qrCodeBase64 = null; 
+                    
+                    $this->logger->info('Using business QR code for payment.', [
+                        'trade_no' => $tradeNo,
+                        'payment_amount' => $paymentAmount,
+                        'qr_code_path' => $qrCodePath,
+                        'qr_code_url' => $qrCodeUrl
+                    ]);
+                } else {
+                    $alipayTransfer = new AlipayTransfer($this->config);
+                    $paymentUrl = $alipayTransfer->createOrder(
+                        $params['out_trade_no'],
+                        $paymentAmount,
+                        $params['name']
+                    );
+
+                    $qrCodeGenerator = new QRCodeGenerator();
+                    $qrCodeBase64 = $qrCodeGenerator->generate($paymentUrl);
+                    $qrCodeUrl = null; 
+                    
+                    $this->logger->info('Using transfer QR code for payment.', [
+                        'trade_no' => $tradeNo,
+                        'payment_url' => $paymentUrl
                     ]);
                 }
             }
-            
-            // Create order record in the database
-            $this->db->insert('codepay_orders', [
-                'id' => $tradeNo,
-                'out_trade_no' => $params['out_trade_no'],
-                'type' => $params['type'],
-                'pid' => $params['pid'],
-                'name' => $params['name'],
-                'price' => $originalAmount,  // 存储原始金额
-                'payment_amount' => $paymentAmount,  // 存储实际支付金额
-                'status' => 0,
-                'add_time' => date('Y-m-d H:i:s'),
-                'notify_url' => $params['notify_url'],
-                'return_url' => $params['return_url'],
-                'sitename' => $params['sitename'] ?? ''
-            ]);
-            
-            $this->logger->info('Order record created in database.', [
-                'trade_no' => $tradeNo,
-                'original_amount' => $originalAmount,
-                'payment_amount' => $paymentAmount
-            ]);
 
-            // 根据收款模式生成不同的支付二维码
-            if ($businessQrMode) {
-                // 经营码收款模式：使用上传的经营码二维码
-                $qrCodePath = $this->config['payment']['business_qr_mode']['qr_code_path'];
-                
-                if (!file_exists($qrCodePath)) {
-                    throw new \Exception('经营码二维码文件不存在，请先上传经营码到: ' . $qrCodePath);
-                }
-                
-                // 生成二维码访问URL
-                $token = md5('qrcode_access_' . date('Y-m-d'));
-                $baseUrl = $this->getBaseUrl();
-                $qrCodeUrl = $baseUrl . '/qrcode.php?type=business&token=' . $token;
-                
-                $paymentUrl = '经营码收款模式';  // 经营码模式不需要支付URL
-                $qrCodeBase64 = null;  // 经营码模式不使用base64
-                
-                $this->logger->info('Using business QR code for payment.', [
-                    'trade_no' => $tradeNo,
-                    'payment_amount' => $paymentAmount,
-                    'qr_code_path' => $qrCodePath,
-                    'qr_code_url' => $qrCodeUrl
-                ]);
-            } else {
-                // 传统转账模式：动态生成转账二维码
-                $alipayTransfer = new AlipayTransfer($this->config);
-                $paymentUrl = $alipayTransfer->createOrder(
-                    $params['out_trade_no'],
-                    $paymentAmount,  // 使用调整后的金额
-                    $params['name']
-                );
-
-                // Generate QR code
-                $qrCodeGenerator = new QRCodeGenerator();
-                $qrCodeBase64 = $qrCodeGenerator->generate($paymentUrl);
-                $qrCodeUrl = null;  // 传统模式不使用URL
-                
-                $this->logger->info('Using transfer QR code for payment.', [
-                    'trade_no' => $tradeNo,
-                    'payment_url' => $paymentUrl
-                ]);
-            }
-
+            // 构造返回数据
             $response = [
                 'code' => 1,
                 'msg' => 'SUCCESS',
-                'pid' => $params['pid'], // 增加pid确保返回
+                'pid' => $params['pid'], 
                 'trade_no' => $tradeNo,
                 'out_trade_no' => $params['out_trade_no'],
                 'money' => $params['money'],  // 原始金额
@@ -357,14 +400,12 @@ class CodePay
                 'payment_url' => $paymentUrl
             ];
             
-            // 根据收款模式添加二维码字段
             if ($businessQrMode) {
-                $response['qr_code_url'] = $qrCodeUrl;  // 经营码模式使用URL
+                $response['qr_code_url'] = $qrCodeUrl; 
             } else {
-                $response['qr_code'] = $qrCodeBase64;   // 传统模式使用base64
+                $response['qr_code'] = $qrCodeBase64; 
             }
             
-            // 如果启用了经营码收款模式，添加详细信息
             if ($businessQrMode) {
                 $response['business_qr_mode'] = true;
                 $response['payment_instruction'] = "请使用支付宝扫描二维码，支付金额：{$paymentAmount} 元";
@@ -384,7 +425,7 @@ class CodePay
                 ];
             }
 
-            $this->logger->info('Payment created successfully.', ['trade_no' => $tradeNo]);
+            $this->logger->info('Payment response generated.', ['trade_no' => $tradeNo]);
             return $response;
             
         } catch (\Exception $e) {
