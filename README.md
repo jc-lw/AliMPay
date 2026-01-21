@@ -91,7 +91,50 @@ cd /www/wwwroot/你的域名/
 # 安装生产环境依赖
 composer install --no-dev --optimize-autoloader
 
+### 3.2 设置文件权限 (非常重要)
+确保 Web 服务 (www用户) 能写入数据库和日志。
+```
+# 将所有文件拥有者改为 www
+chown -R www:www /www/wwwroot/你的域名/
 
+# 设置目录读写权限
+chmod -R 755 /www/wwwroot/你的域名/
+chmod -R 777 /www/wwwroot/你的域名/data
+chmod -R 777 /www/wwwroot/你的域名/logs
+chmod -R 777 /www/wwwroot/你的域名/config
+chmod -R 777 /www/wwwroot/你的域名/qrcodes
+```
+
+### 3.3  Nginx 安全加固
+为了防止 SQLite 数据库 (.db) 和配置文件被直接下载，必须修改 Nginx 配置。 进入 Website -> 点击域名 -> Config，在 server { ... } 块中添加：
+```
+# 禁止访问敏感目录
+location ~ ^/(data|config|src|vendor|logs)/ {
+    deny all;
+    return 404;
+}
+
+# 禁止下载敏感文件类型
+location ~ \.(db|lock|json|log)$ {
+    deny all;
+    return 404;
+}
+
+# 禁止访问 Composer 文件
+location ~ /composer\.(json|lock)$ {
+    deny all;
+    return 404;
+}
+```
+### 3.3  首次初始化
+在 SSH 终端执行以下命令（模拟 Web 请求来触发初始化）：
+```
+# 替换为你的实际目录
+cd /www/wwwroot/你的域名/
+
+# 强制触发监控启动和数据库生成
+php -r '$_GET["action"]="force-start"; require "health.php";'
+```
 ### 3. 支付宝配置
 
 #### 获取支付宝应用参数
@@ -301,4 +344,5 @@ MIT License
 ## 免责声明
 
 本项目仅供学习交流使用，使用者需确保遵守相关法律法规和支付宝服务协议。 
+
 
